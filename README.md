@@ -1,23 +1,44 @@
-# Fulbright Auth
+# Fulbright Modules
 
-Frappe app that emails a one-time sign-in link. The link opens the Fulbright Next.js app at `/login/link`, not the ERPNext desk.
+Shared Frappe app for Fulbright. One repo, one `apps.json` entry, one `install-app`. New features go in as modules under `fulbright_modules/`.
 
-The method is `fulbright_auth.api.send_login_link`. It stores the same cache key ERPNext already accepts (`one_time_login_key:{key}`), so the Next.js app can redeem it with `frappe.www.login.login_via_key`.
+## Layout
 
-Outgoing mail must already work. This method does not use the **Login with email link** switch in System Settings.
+```text
+fulbright-modules/
+  pyproject.toml
+  README.md
+  fulbright_modules/
+    hooks.py
+    modules.txt          # Auth, Gmail, …
+    auth/
+      api.py             # sign-in links, password reset
+      async_email.py     # background mail + OTP patch
+    gmail/
+      api.py             # connect / list / disconnect Gmail
+```
 
-## Add it to the image
+## Add a module
 
-In `erp-next/frappe_docker/apps.json`, add this repository next to ERPNext and HRMS:
+1. Add the module name to `fulbright_modules/modules.txt`.
+2. Create `fulbright_modules/<module>/` with `__init__.py` and your code.
+3. Whitelist methods with `@frappe.whitelist`. Paths become `fulbright_modules.<module>.api.<method>`.
+4. Push to `main`, rebuild the custom image, then restart the backend so the site picks up the new code.
+
+## Install
+
+In `erp-next/frappe_docker/apps.json`, list this repository next to ERPNext and HRMS:
 
 ```json
 {
-  "url": "https://github.com/kiruba56/fulbright-auth-app",
+  "url": "https://github.com/kiruba56/fulbright-modules",
   "branch": "main"
 }
 ```
 
-From `erp-next/frappe_docker`, rebuild the image that Compose already tags `custom:16`:
+`apps.json` installs from GitHub. Push changes to `main` before rebuilding, or the image will miss methods the Next.js app already calls.
+
+From `erp-next/frappe_docker`, rebuild the image that Compose tags `custom:16`:
 
 ```bash
 docker build \
@@ -41,12 +62,12 @@ docker compose \
   -p erpnext \
   up -d
 
-docker compose -p erpnext exec backend bench --site fulbright install-app fulbright_auth
+docker compose -p erpnext exec backend bench --site fulbright install-app fulbright_modules
 docker compose -p erpnext exec backend bench --site fulbright set-config fulbright_app_url http://localhost:3000
 docker compose -p erpnext restart backend
 ```
 
-`fulbright_app_url` is the public address of the Next.js app. Locally that is `http://localhost:3000`. In production, set it to the real app URL before anyone requests a link.
+`fulbright_app_url` is the public address of the Next.js app. Locally that is `http://localhost:3000`. In production, set it to the real app URL before anyone requests a link or connects Gmail.
 
 Confirm the app is installed:
 
@@ -54,18 +75,39 @@ Confirm the app is installed:
 docker compose -p erpnext exec backend bench --site fulbright list-apps
 ```
 
-## Call it from Fulbright
+### One-time migration from `fulbright_auth`
+
+Sites that still have the old app must uninstall it on the **current** image before rebuilding. A site that lists an app missing from the image fails `migrate`.
+
+```bash
+docker compose -p erpnext exec backend bench --site fulbright uninstall-app fulbright_auth --yes --no-backup
+# rebuild custom:16 with the new apps.json, then up -d
+docker compose -p erpnext exec backend bench --site fulbright install-app fulbright_modules
+docker compose -p erpnext restart backend
+```
+
+Sign-in links stop working between the uninstall and the install. Deploy the Next.js method-path change at the same time.
+
+Also rename the GitHub repository from `fulbright-auth-app` to `fulbright-modules` so the `apps.json` URL resolves.
+
+## Auth
+
+Emails a one-time sign-in link. The link opens the Fulbright Next.js app at `/login/link`, not the ERPNext desk.
+
+Outgoing mail must already work. This method does not use the **Login with email link** switch in System Settings.
+
+### Call it from Fulbright
 
 The Next.js server, not the browser, posts the user's email:
 
 ```http
-POST /api/method/fulbright_auth.api.send_login_link
+POST /api/method/fulbright_modules.auth.api.send_login_link
 Content-Type: application/json
 
 { "email": "person@company.com" }
 ```
 
-A missing account still returns success, so the response does not reveal who has an account. More than ten requests an hour from the same IP return HTTP 429. The Fulbright server sends these requests, so that limit is shared for the server.
+A missing account still returns success, so the response does not reveal who has an account. More than ten requests an hour from the same IP return HTTP 429.
 
 The message contains a link like:
 
@@ -76,10 +118,80 @@ http://localhost:3000/login/link?key=...
 That page must call this URL from the server:
 
 ```http
-POST /api/method/fulbright_auth.api.redeem_login_key
+POST /api/method/fulbright_modules.auth.api.redeem_login_key
 Content-Type: application/json
 
 { "key": "..." }
 ```
 
 The response `message` contains `email`, `full_name`, and `sid`. Save that `sid` in the Fulbright session, then redirect the browser to `/`. The key expires in about 10 minutes, or whatever **Login with email link expiry** is set to in System Settings. Each key works once.
+
+Password reset:
+
+```http
+POST /api/method/fulbright_modules.auth.api.send_password_reset
+Content-Type: application/json
+
+{ "email": "person@company.com" }
+```
+
+## Gmail
+
+Lets a signed-in Fulbright user connect, list, reconnect, and remove multiple Gmail accounts. No new DocTypes. Google credentials live in one site **Connected App**. Each mailbox is one **Email Account** whose encrypted `password` field holds the refresh token. Access tokens stay in the Frappe cache.
+
+### One-time setup
+
+1. In Google Cloud, create an OAuth client of type **Web application**. Add one redirect URI per environment:
+   `https://<fulbright-app>/settings/email/callback` (local: `http://localhost:3000/settings/email/callback`).
+2. Put the consent screen **In production**. In Testing status, Google expires refresh tokens after 7 days.
+3. In ERPNext, create a **Connected App** (name it `Fulbright Gmail`, or point site config at an existing one):
+   - Provider Name: `Google`
+   - Client ID / Client Secret: from Google Cloud
+   - Authorization URI: `https://accounts.google.com/o/oauth2/v2/auth`
+   - Token URI: `https://oauth2.googleapis.com/token`
+   - Revocation URI: `https://oauth2.googleapis.com/revoke`
+   - OpenID Configuration / Userinfo URI: `https://openidconnect.googleapis.com/v1/userinfo`
+   - Scopes (one row each): `openid`, `email`, `https://www.googleapis.com/auth/gmail.modify`, `https://www.googleapis.com/auth/gmail.send`
+4. If the Connected App is not named `Fulbright Gmail`, set:
+   `bench --site fulbright set-config fulbright_gmail_connected_app <Connected App name>`
+5. Keep the site `encryption_key` stable. Losing it makes every stored refresh token unreadable.
+
+`gmail.modify` is a restricted scope. An Internal app is enough for a Google Workspace org. Consumer `@gmail.com` accounts need Google's restricted-scope verification before the consent screen works for everyone. Adding or changing scopes later means every user must reconnect.
+
+### Call it from Fulbright
+
+All methods require a logged-in user. The Next.js server sends `Cookie: sid=...` from the Fulbright session.
+
+```http
+POST /api/method/fulbright_modules.gmail.api.start_gmail_connect
+```
+
+Returns `{ "auth_url": "https://accounts.google.com/..." }`. Redirect the browser there.
+
+Google redirects to `/settings/email/callback?code=...&state=...`. The Next.js route then calls:
+
+```http
+POST /api/method/fulbright_modules.gmail.api.finish_gmail_connect
+Content-Type: application/json
+
+{ "code": "...", "state": "..." }
+```
+
+Returns `{ "email": "person@gmail.com" }`.
+
+```http
+POST /api/method/fulbright_modules.gmail.api.list_gmail_accounts
+```
+
+Returns `[{ "email", "status", "connected_at" }]`. `status` is `connected` or `needs_reconnect`. Tokens are never returned.
+
+```http
+POST /api/method/fulbright_modules.gmail.api.disconnect_gmail
+Content-Type: application/json
+
+{ "email": "person@gmail.com" }
+```
+
+Revokes the grant at Google (best effort) and deletes that Email Account.
+
+`get_access_token(account)` is an internal helper for later read/send work. It refreshes under a lock, stores the access token in cache, and on `invalid_grant` clears the refresh token so the account shows as needing reconnect.

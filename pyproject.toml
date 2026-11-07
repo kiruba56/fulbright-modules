@@ -1,9 +1,9 @@
 [project]
-name = "fulbright_auth"
+name = "fulbright_modules"
 authors = [
     { name = "Fulbright", email = "mail@example.com" }
 ]
-description = "Email sign-in links that open the Fulbright app"
+description = "Shared Fulbright Frappe modules for the Fulbright app"
 requires-python = ">=3.10"
 readme = "README.md"
 dynamic = ["version"]

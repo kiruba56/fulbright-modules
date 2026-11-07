@@ -2,7 +2,7 @@ import frappe
 from frappe import _
 from frappe.rate_limiter import rate_limit
 
-from fulbright_auth.async_email import start_immediately
+from fulbright_modules.auth.async_email import start_immediately
 
 
 def _email_link_limit() -> int:
