@@ -145,7 +145,7 @@ def _owned_account(email: str, user: str):
 
 
 @frappe.whitelist(methods=["POST"])
-@rate_limit(limit=_connect_limit, seconds=60 * 60)
+@rate_limit(limit=_connect_limit, seconds=60 * 60, user_based=True)
 def start_gmail_connect():
 	"""Return a Google authorization URL. Cache state + PKCE verifier for 10 minutes."""
 	user = _require_logged_in()
@@ -201,13 +201,25 @@ def finish_gmail_connect(code: str | None = None, state: str | None = None):
 	if not email:
 		frappe.throw(_("Google did not return an email address."))
 
-	existing_owner = frappe.db.get_value(
+	app_name = _resolve_connected_app_name()
+	existing = frappe.db.get_value(
 		"Email Account",
-		{"email_id": email, "connected_app": _resolve_connected_app_name()},
-		"connected_user",
+		email,
+		["connected_app", "connected_user"],
+		as_dict=True,
+	) or frappe.db.get_value(
+		"Email Account",
+		{"email_id": email},
+		["name", "connected_app", "connected_user"],
+		as_dict=True,
 	)
-	if existing_owner and existing_owner != user:
-		frappe.throw(_("That Gmail account is already connected to another user."))
+	if existing:
+		if existing.connected_app != app_name:
+			frappe.throw(
+				_("{0} is already used by another Email Account in ERPNext.").format(email)
+			)
+		if existing.connected_user != user:
+			frappe.throw(_("That Gmail account is already connected to another user."))
 
 	refresh_token = token.get("refresh_token")
 	account_name = frappe.db.get_value(
@@ -233,7 +245,7 @@ def finish_gmail_connect(code: str | None = None, state: str | None = None):
 		account = frappe.get_doc("Email Account", account_name)
 		account.password = refresh_token
 		account.connected_user = user
-		account.connected_app = _resolve_connected_app_name()
+		account.connected_app = app_name
 		account.service = "GMail"
 		account.auth_method = "Basic"
 		account.enable_incoming = 0
