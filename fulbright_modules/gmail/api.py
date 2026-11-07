@@ -30,7 +30,7 @@ def _require_logged_in() -> str:
 	return user
 
 
-def _resolve_resolve_connected_app_name() -> str:
+def _resolve_connected_app_name() -> str:
 	"""Pick the Google Connected App without requiring a bench set-config in normal setups.
 
 	Order:
@@ -90,7 +90,7 @@ def _redirect_uri() -> str:
 
 
 def _get_connected_app():
-	return frappe.get_doc("Connected App", _resolve_resolve_connected_app_name())
+	return frappe.get_doc("Connected App", _resolve_connected_app_name())
 
 
 def _scopes(app) -> list[str]:
