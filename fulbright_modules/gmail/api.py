@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import json
 import secrets
 from urllib.parse import urlencode
 
@@ -385,7 +386,18 @@ def _refresh_access_token(app, refresh_token: str) -> dict:
 	return payload
 
 
+def _normalize_email(value) -> str | None:
+	if isinstance(value, str) and value.strip():
+		return value.strip().lower()
+	return None
+
+
 def _email_from_token(app, token: dict) -> str | None:
+	"""Resolve the mailbox address from the OAuth token.
+
+	Connected Apps often only grant https://mail.google.com/, which cannot call
+	OpenID userinfo. Prefer userinfo when available, then id_token, then Gmail profile.
+	"""
 	access_token = token.get("access_token")
 	if not access_token:
 		return None
@@ -396,11 +408,36 @@ def _email_from_token(app, token: dict) -> str | None:
 		headers={"Authorization": f"Bearer {access_token}"},
 		timeout=30,
 	)
-	payload = _json_or_empty(response)
-	if not response.ok:
-		frappe.throw(_("Could not read the Google account email."))
-	email = payload.get("email")
-	return email.strip().lower() if isinstance(email, str) and email.strip() else None
+	if response.ok:
+		email = _normalize_email(_json_or_empty(response).get("email"))
+		if email:
+			return email
+
+	id_token = token.get("id_token")
+	if isinstance(id_token, str) and id_token.count(".") == 2:
+		try:
+			payload_part = id_token.split(".")[1]
+			padding = "=" * (-len(payload_part) % 4)
+			claims = json.loads(base64.urlsafe_b64decode(payload_part + padding))
+			email = _normalize_email(claims.get("email"))
+			if email:
+				return email
+		except Exception:
+			pass
+
+	# Works with https://mail.google.com/ and gmail.* scopes.
+	profile = requests.get(
+		"https://gmail.googleapis.com/gmail/v1/users/me/profile",
+		headers={"Authorization": f"Bearer {access_token}"},
+		timeout=30,
+	)
+	if profile.ok:
+		email = _normalize_email(_json_or_empty(profile).get("emailAddress"))
+		if email:
+			return email
+
+	frappe.throw(_("Could not read the Google account email."))
+
 
 
 def _cache_access_token(account: str, token: dict) -> None:
