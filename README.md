@@ -144,7 +144,7 @@ Lets a signed-in Fulbright user connect, list, reconnect, and remove multiple Gm
 1. In Google Cloud, create an OAuth client of type **Web application**. Add one redirect URI per environment:
    `https://<fulbright-app>/settings/email/callback` (local: `http://localhost:3000/settings/email/callback`).
 2. Put the consent screen **In production**. In Testing status, Google expires refresh tokens after 7 days.
-3. In ERPNext, create a **Connected App** (name it `Fulbright Gmail`, or point site config at an existing one):
+3. In ERPNext, create a **Connected App** for Google (Provider Name `Google` is enough; the document name can be anything):
    - Provider Name: `Google`
    - Client ID / Client Secret: from Google Cloud
    - Authorization URI: `https://accounts.google.com/o/oauth2/v2/auth`
@@ -152,8 +152,7 @@ Lets a signed-in Fulbright user connect, list, reconnect, and remove multiple Gm
    - Revocation URI: `https://oauth2.googleapis.com/revoke`
    - OpenID Configuration / Userinfo URI: `https://openidconnect.googleapis.com/v1/userinfo`
    - Scopes (one row each): `openid`, `email`, `https://www.googleapis.com/auth/gmail.modify`, `https://www.googleapis.com/auth/gmail.send`
-4. If the Connected App is not named `Fulbright Gmail`, set:
-   `bench --site fulbright set-config fulbright_gmail_connected_app <Connected App name>`
+4. The Gmail module finds that app automatically: site config override → name `Fulbright Gmail` → the only Google Connected App. Only set `fulbright_gmail_connected_app` if you have more than one Google Connected App.
 5. Keep the site `encryption_key` stable. Losing it makes every stored refresh token unreadable.
 
 `gmail.modify` is a restricted scope. An Internal app is enough for a Google Workspace org. Consumer `@gmail.com` accounts need Google's restricted-scope verification before the consent screen works for everyone. Adding or changing scopes later means every user must reconnect.

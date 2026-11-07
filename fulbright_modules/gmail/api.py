@@ -30,8 +30,52 @@ def _require_logged_in() -> str:
 	return user
 
 
-def _connected_app_name() -> str:
-	return (frappe.conf.get("fulbright_gmail_connected_app") or DEFAULT_CONNECTED_APP_NAME).strip()
+def _resolve_resolve_connected_app_name() -> str:
+	"""Pick the Google Connected App without requiring a bench set-config in normal setups.
+
+	Order:
+	1. site config `fulbright_gmail_connected_app` (explicit override)
+	2. Connected App named `Fulbright Gmail`
+	3. The only Connected App whose provider is Google (or Google auth URI)
+	"""
+	configured = (frappe.conf.get("fulbright_gmail_connected_app") or "").strip()
+	if configured:
+		if not frappe.db.exists("Connected App", configured):
+			frappe.throw(
+				_("Connected App {0} from site config was not found.").format(frappe.bold(configured))
+			)
+		return configured
+
+	if frappe.db.exists("Connected App", DEFAULT_CONNECTED_APP_NAME):
+		return DEFAULT_CONNECTED_APP_NAME
+
+	google_apps: list[str] = []
+	for app in frappe.get_all(
+		"Connected App",
+		fields=["name", "provider_name", "authorization_uri"],
+	):
+		provider = (app.provider_name or "").strip().lower()
+		auth_uri = (app.authorization_uri or "").lower()
+		if provider == "google" or "accounts.google.com" in auth_uri:
+			google_apps.append(app.name)
+
+	if len(google_apps) == 1:
+		return google_apps[0]
+
+	if len(google_apps) > 1:
+		frappe.throw(
+			_(
+				"Multiple Google Connected Apps found ({0}). Rename one to {1} or set "
+				"fulbright_gmail_connected_app in site config."
+			).format(", ".join(google_apps), frappe.bold(DEFAULT_CONNECTED_APP_NAME))
+		)
+
+	frappe.throw(
+		_(
+			"No Google Connected App found. Create one with Provider Name {0}, "
+			"or name it {1}."
+		).format(frappe.bold("Google"), frappe.bold(DEFAULT_CONNECTED_APP_NAME))
+	)
 
 
 def _app_url() -> str:
@@ -46,14 +90,7 @@ def _redirect_uri() -> str:
 
 
 def _get_connected_app():
-	name = _connected_app_name()
-	if not name or not frappe.db.exists("Connected App", name):
-		frappe.throw(
-			_("Connected App {0} is not set up. Create it in ERPNext first.").format(
-				frappe.bold(name or DEFAULT_CONNECTED_APP_NAME)
-			)
-		)
-	return frappe.get_doc("Connected App", name)
+	return frappe.get_doc("Connected App", _resolve_resolve_connected_app_name())
 
 
 def _scopes(app) -> list[str]:
@@ -77,7 +114,7 @@ def _token_key(account: str) -> str:
 
 
 def _account_filters(user: str | None = None) -> dict:
-	filters = {"connected_app": _connected_app_name(), "service": "GMail"}
+	filters = {"connected_app": _resolve_connected_app_name(), "service": "GMail"}
 	if user:
 		filters["connected_user"] = user
 	return filters
@@ -114,11 +151,11 @@ def start_gmail_connect():
 	app = _get_connected_app()
 	client_id = app.client_id
 	if not client_id:
-		frappe.throw(_("Connected App {0} is missing a Client ID.").format(_connected_app_name()))
+		frappe.throw(_("Connected App {0} is missing a Client ID.").format(_resolve_connected_app_name()))
 
 	authorization_uri = (app.authorization_uri or "").strip()
 	if not authorization_uri:
-		frappe.throw(_("Connected App {0} is missing an Authorization URI.").format(_connected_app_name()))
+		frappe.throw(_("Connected App {0} is missing an Authorization URI.").format(_resolve_connected_app_name()))
 
 	verifier, challenge = _pkce_pair()
 	state = secrets.token_urlsafe(24)
@@ -165,7 +202,7 @@ def finish_gmail_connect(code: str | None = None, state: str | None = None):
 
 	existing_owner = frappe.db.get_value(
 		"Email Account",
-		{"email_id": email, "connected_app": _connected_app_name()},
+		{"email_id": email, "connected_app": _resolve_connected_app_name()},
 		"connected_user",
 	)
 	if existing_owner and existing_owner != user:
@@ -195,7 +232,7 @@ def finish_gmail_connect(code: str | None = None, state: str | None = None):
 		account = frappe.get_doc("Email Account", account_name)
 		account.password = refresh_token
 		account.connected_user = user
-		account.connected_app = _connected_app_name()
+		account.connected_app = _resolve_connected_app_name()
 		account.service = "GMail"
 		account.auth_method = "Basic"
 		account.enable_incoming = 0
@@ -214,7 +251,7 @@ def finish_gmail_connect(code: str | None = None, state: str | None = None):
 				"auth_method": "Basic",
 				"password": refresh_token,
 				"connected_user": user,
-				"connected_app": _connected_app_name(),
+				"connected_app": _resolve_connected_app_name(),
 				"enable_incoming": 0,
 				"enable_outgoing": 0,
 				"default_incoming": 0,
@@ -278,7 +315,7 @@ def get_access_token(account: str) -> str:
 			return cached["access_token"]
 
 		doc = frappe.get_doc("Email Account", account)
-		if doc.connected_app != _connected_app_name():
+		if doc.connected_app != _resolve_connected_app_name():
 			frappe.throw(_("Not a Fulbright Gmail account."))
 
 		refresh_token = doc.get_password("password", raise_exception=False)
