@@ -21,6 +21,7 @@ From `erp-next/frappe_docker`, rebuild the image that Compose already tags `cust
 
 ```bash
 docker build \
+  --load \
   --no-cache \
   --build-arg=FRAPPE_PATH=https://github.com/frappe/frappe \
   --build-arg=FRAPPE_BRANCH=version-16 \
@@ -64,7 +65,7 @@ Content-Type: application/json
 { "email": "person@company.com" }
 ```
 
-A missing account still returns success, so the response does not reveal who has an account. More than five requests an hour for the same address return HTTP 429.
+A missing account still returns success, so the response does not reveal who has an account. More than ten requests an hour from the same IP return HTTP 429. The Fulbright server sends these requests, so that limit is shared for the server.
 
 The message contains a link like:
 
@@ -72,10 +73,13 @@ The message contains a link like:
 http://localhost:3000/login/link?key=...
 ```
 
-That page must call this URL from the server, without following the redirect, and read the `sid` cookie from the response:
+That page must call this URL from the server:
 
-```text
-GET /api/method/frappe.www.login.login_via_key?key=...
+```http
+POST /api/method/fulbright_auth.api.redeem_login_key
+Content-Type: application/json
+
+{ "key": "..." }
 ```
 
-Save that `sid` in the Fulbright session, then redirect the browser to `/`. The key expires in about 10 minutes, or whatever **Login with email link expiry** is set to in System Settings. Each key works once.
+The response `message` contains `email`, `full_name`, and `sid`. Save that `sid` in the Fulbright session, then redirect the browser to `/`. The key expires in about 10 minutes, or whatever **Login with email link expiry** is set to in System Settings. Each key works once.
