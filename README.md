@@ -139,6 +139,13 @@ Content-Type: application/json
 
 Lets a signed-in Fulbright user connect, list, reconnect, and remove multiple Gmail accounts. No new DocTypes. Google credentials live in one site **Connected App**. Each mailbox is one **Email Account** whose encrypted `password` field holds the refresh token. Access tokens stay in the Frappe cache.
 
+Connect stays exclusive: only one Fulbright user owns a given Gmail address. The owner can share that inbox with **every logged-in ERPNext user** using two independent Check custom fields on Email Account:
+
+- `fulbright_team_view` — anyone can view
+- `fulbright_team_reply` — anyone can reply
+
+Reply implies view: turning reply on also turns view on, and turning view off also turns reply off. `bench migrate` (or installing the app) creates the fields via `after_migrate` / `after_install`.
+
 ### One-time setup
 
 1. In Google Cloud, create an OAuth client of type **Web application**. Add one redirect URI per environment:
@@ -182,7 +189,20 @@ Returns `{ "email": "person@gmail.com" }`.
 POST /api/method/fulbright_modules.gmail.api.list_gmail_accounts
 ```
 
-Returns `[{ "email", "status", "connected_at" }]`. `status` is `connected` or `needs_reconnect`. Tokens are never returned.
+Returns owned accounts plus team-shared accounts the caller can see:
+
+`[{ "email", "status", "connected_at", "is_owner", "owner", "team_view", "team_reply" }]`.
+
+`status` is `connected` or `needs_reconnect`. Tokens are never returned.
+
+```http
+POST /api/method/fulbright_modules.gmail.api.set_gmail_sharing
+Content-Type: application/json
+
+{ "email": "person@gmail.com", "team_view": 1, "team_reply": 0 }
+```
+
+Owner only. Normalizes flags (reply ⇒ view) and returns `{ "ok", "email", "team_view", "team_reply" }`.
 
 ```http
 POST /api/method/fulbright_modules.gmail.api.disconnect_gmail
@@ -191,6 +211,6 @@ Content-Type: application/json
 { "email": "person@gmail.com" }
 ```
 
-Revokes the grant at Google (best effort) and deletes that Email Account.
+Owner only. Revokes the grant at Google (best effort) and deletes that Email Account.
 
-`get_access_token(account)` is an internal helper for later read/send work. It refreshes under a lock, stores the access token in cache, and on `invalid_grant` clears the refresh token so the account shows as needing reconnect.
+`get_access_token(account, user=None, need="view")` is an internal helper for later read/send work. When `user` is set, it checks owner or team view/reply access first (`need` is `"view"` or `"reply"`). It refreshes under a lock, stores the access token in cache, and on `invalid_grant` clears the refresh token so the account shows as needing reconnect.

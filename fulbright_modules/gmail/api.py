@@ -144,6 +144,64 @@ def _owned_account(email: str, user: str):
 	return frappe.get_doc("Email Account", name)
 
 
+def _normalize_sharing(team_view, team_reply) -> tuple[int, int]:
+	"""Reply implies view; clearing view also clears reply."""
+	view = 1 if team_view else 0
+	reply = 1 if team_reply else 0
+	if reply:
+		view = 1
+	if not view:
+		reply = 0
+	return view, reply
+
+
+def _owner_label(connected_user: str | None) -> str | None:
+	if not connected_user:
+		return None
+	full_name = frappe.db.get_value("User", connected_user, "full_name")
+	if full_name:
+		return full_name
+	return connected_user
+
+
+def _accessible_account(email: str, user: str, need: str = "view"):
+	"""Return a Fulbright Gmail Email Account the user may view or reply with."""
+	email = (email or "").strip()
+	if not email:
+		frappe.throw(_("Email is required"))
+	if need not in ("view", "reply"):
+		frappe.throw(_("Invalid access need."))
+
+	row = frappe.db.get_value(
+		"Email Account",
+		{**_account_filters(), "email_id": email},
+		[
+			"name",
+			"connected_user",
+			"fulbright_team_view",
+			"fulbright_team_reply",
+		],
+		as_dict=True,
+	)
+	if not row:
+		frappe.throw(_("That Gmail account is not connected."), frappe.PermissionError)
+
+	is_owner = row.connected_user == user
+	team_view = int(row.fulbright_team_view or 0)
+	team_reply = int(row.fulbright_team_reply or 0)
+
+	if is_owner:
+		return frappe.get_doc("Email Account", row.name)
+
+	if need == "reply" and team_reply:
+		return frappe.get_doc("Email Account", row.name)
+
+	if need == "view" and (team_view or team_reply):
+		return frappe.get_doc("Email Account", row.name)
+
+	frappe.throw(_("You do not have access to that Gmail account."), frappe.PermissionError)
+
+
 @frappe.whitelist(methods=["POST"])
 @rate_limit(limit=_connect_limit, seconds=60 * 60, user_based=True)
 def start_gmail_connect():
@@ -280,24 +338,97 @@ def finish_gmail_connect(code: str | None = None, state: str | None = None):
 
 @frappe.whitelist(methods=["POST"])
 def list_gmail_accounts():
-	"""Return this user's Fulbright Gmail accounts. Never returns tokens."""
+	"""Return owned and team-shared Fulbright Gmail accounts. Never returns tokens."""
 	user = _require_logged_in()
-	rows = frappe.get_all(
+	base = _account_filters()
+	fields = [
+		"name",
+		"email_id",
+		"creation",
+		"connected_user",
+		"fulbright_team_view",
+		"fulbright_team_reply",
+	]
+
+	owned = frappe.get_all(
 		"Email Account",
-		filters=_account_filters(user),
-		fields=["name", "email_id", "creation", "modified"],
+		filters={**base, "connected_user": user},
+		fields=fields,
 		order_by="creation desc",
 	)
+	shared = frappe.get_all(
+		"Email Account",
+		filters=[
+			["connected_app", "=", base["connected_app"]],
+			["service", "=", "GMail"],
+			["connected_user", "!=", user],
+			["fulbright_team_view", "=", 1],
+		],
+		fields=fields,
+		order_by="creation desc",
+	)
+	shared_reply = frappe.get_all(
+		"Email Account",
+		filters=[
+			["connected_app", "=", base["connected_app"]],
+			["service", "=", "GMail"],
+			["connected_user", "!=", user],
+			["fulbright_team_reply", "=", 1],
+		],
+		fields=fields,
+		order_by="creation desc",
+	)
+
+	by_name: dict[str, dict] = {}
+	for row in [*owned, *shared, *shared_reply]:
+		by_name[row.name] = row
+
 	accounts = []
-	for row in rows:
+	for row in sorted(
+		by_name.values(),
+		key=lambda item: item.creation or "",
+		reverse=True,
+	):
+		team_view, team_reply = _normalize_sharing(
+			row.fulbright_team_view, row.fulbright_team_reply
+		)
+		is_owner = row.connected_user == user
 		accounts.append(
 			{
 				"email": row.email_id,
 				"status": "connected" if _has_refresh_token(row.name) else "needs_reconnect",
 				"connected_at": str(row.creation) if row.creation else None,
+				"is_owner": is_owner,
+				"owner": _owner_label(row.connected_user),
+				"team_view": bool(team_view),
+				"team_reply": bool(team_reply),
 			}
 		)
 	return accounts
+
+
+@frappe.whitelist(methods=["POST"])
+def set_gmail_sharing(
+	email: str | None = None,
+	team_view: int | bool | str | None = 0,
+	team_reply: int | bool | str | None = 0,
+):
+	"""Owner-only: set team view / reply flags. Reply implies view."""
+	user = _require_logged_in()
+	account = _owned_account(email, user)
+	view, reply = _normalize_sharing(
+		frappe.utils.cint(team_view),
+		frappe.utils.cint(team_reply),
+	)
+	account.fulbright_team_view = view
+	account.fulbright_team_reply = reply
+	account.save(ignore_permissions=True)
+	return {
+		"ok": True,
+		"email": account.email_id,
+		"team_view": bool(view),
+		"team_reply": bool(reply),
+	}
 
 
 @frappe.whitelist(methods=["POST"])
@@ -313,10 +444,21 @@ def disconnect_gmail(email: str | None = None):
 	return {"ok": True, "email": email}
 
 
-def get_access_token(account: str) -> str:
-	"""Return a usable access token for a Fulbright Gmail Email Account. Internal helper."""
+def get_access_token(
+	account: str,
+	user: str | None = None,
+	need: str = "view",
+) -> str:
+	"""Return a usable access token for a Fulbright Gmail Email Account. Internal helper.
+
+	When ``user`` is set, enforce owner or team view/reply access first.
+	"""
 	if not account:
 		frappe.throw(_("Account is required"))
+
+	if user:
+		doc = frappe.get_doc("Email Account", account)
+		_accessible_account(doc.email_id, user, need=need or "view")
 
 	cached = frappe.cache.get_value(_token_key(account))
 	if cached and cached.get("access_token"):
