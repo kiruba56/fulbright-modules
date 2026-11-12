@@ -59,7 +59,31 @@ def _reset_key_expired(user_name: str) -> bool:
 	return time_diff_in_seconds(now_datetime(), generated_on) > hours * 60 * 60
 
 
+def _require_employee_write():
+	if frappe.session.user in (None, "Guest"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	if not frappe.has_permission("Employee", "write"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+
+def _require_employee_login_user(email: str) -> str:
+	"""Ensure email is a User linked as Employee.user_id (and readable)."""
+	email = (email or "").strip()
+	if not email:
+		frappe.throw(_("Email is required"))
+
+	employee = frappe.db.get_value("Employee", {"user_id": email}, "name")
+	if not employee:
+		frappe.throw(_("No employee login user matches {0}").format(email))
+
+	if not frappe.has_permission("Employee", "read", employee):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	return email
+
+
 @frappe.whitelist(allow_guest=True, methods=["POST"])
+@rate_limit(limit=_password_reset_limit, seconds=60 * 60)
 def check_password_reset_key(key: str):
 	"""Return whether a Fulbright /set-password key is still usable (does not consume it)."""
 	key = (key or "").strip()
@@ -117,37 +141,37 @@ def deliver_login_link(email: str, link: str, expiry: int):
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 @rate_limit(limit=_password_reset_limit, seconds=60 * 60)
 def send_password_reset(email: str):
-	"""Check the account, then return. The reset email starts immediately."""
+	"""Public forgot-password. Always returns the same success shape (no account oracle)."""
 	email = (email or "").strip()
 	if not email:
 		frappe.throw(_("Email is required"))
 
+	# Uniform response — do not reveal whether the account exists / is disabled.
+	ok = "queued"
+
 	if not frappe.db.exists("User", email):
-		return "not found"
+		return ok
 
 	user = frappe.get_doc("User", email)
 	if user.name == "Administrator" or not user.enabled:
-		return "disabled"
+		return ok
 
 	try:
 		user.validate_reset_password()
 	except frappe.ValidationError:
-		return "not allowed"
+		return ok
 
 	account = user.name
 	start_immediately(lambda: deliver_password_reset(account))
+	return ok
 
 
 @frappe.whitelist(methods=["POST"])
 @rate_limit(limit=_password_reset_limit, seconds=60 * 60)
 def send_password_reset_invite(email: str):
-	"""Admin: email a Fulbright /set-password reset link (clear errors)."""
-	email = (email or "").strip()
-	if not email:
-		frappe.throw(_("Email is required"))
-
-	if frappe.session.user in (None, "Guest"):
-		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	"""HR: email a Fulbright /set-password reset link for an Employee login user."""
+	_require_employee_write()
+	email = _require_employee_login_user(email)
 
 	if not frappe.db.exists("User", email):
 		frappe.throw(_("User {0} does not exist").format(email))
@@ -191,13 +215,9 @@ def deliver_password_reset(email: str):
 @frappe.whitelist(methods=["POST"])
 @rate_limit(limit=_password_reset_limit, seconds=60 * 60)
 def send_welcome_invite(email: str):
-	"""Email a Next.js /set-password invite after HR creates a User."""
-	email = (email or "").strip()
-	if not email:
-		frappe.throw(_("Email is required"))
-
-	if frappe.session.user in (None, "Guest"):
-		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	"""HR: email a Next.js /set-password invite for an Employee login user."""
+	_require_employee_write()
+	email = _require_employee_login_user(email)
 
 	if not frappe.db.exists("User", email):
 		frappe.throw(_("User {0} does not exist").format(email))
@@ -235,6 +255,7 @@ def deliver_welcome_invite(email: str):
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
+@rate_limit(limit=_password_reset_limit, seconds=60 * 60)
 def set_password_with_key(key: str, new_password: str):
 	"""Set password from a Fulbright invite/reset key and return an ERPNext session."""
 	from frappe.core.doctype.user.user import update_password as stock_update_password
