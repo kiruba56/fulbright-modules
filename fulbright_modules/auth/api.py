@@ -1,7 +1,7 @@
 import frappe
 from frappe import _
 from frappe.rate_limiter import rate_limit
-from frappe.utils import now_datetime
+from frappe.utils import cint, now_datetime, time_diff_in_seconds
 
 from fulbright_modules.auth.async_email import start_immediately
 
@@ -47,6 +47,36 @@ def _user_from_reset_key(key: str) -> str | None:
 	if not key:
 		return None
 	return frappe.db.get_value("User", {"reset_password_key": _sha256_hash(key)})
+
+
+def _reset_key_expired(user_name: str) -> bool:
+	generated_on = frappe.db.get_value(
+		"User", user_name, "last_reset_password_key_generated_on"
+	)
+	if not generated_on:
+		return True
+	hours = cint(frappe.get_system_settings("reset_password_link_expiry") or 24)
+	return time_diff_in_seconds(now_datetime(), generated_on) > hours * 60 * 60
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def check_password_reset_key(key: str):
+	"""Return whether a Fulbright /set-password key is still usable (does not consume it)."""
+	key = (key or "").strip()
+	if not key:
+		return {"valid": False, "reason": "missing"}
+
+	user = _user_from_reset_key(key)
+	if not user:
+		return {"valid": False, "reason": "used"}
+
+	if not frappe.db.get_value("User", user, "enabled"):
+		return {"valid": False, "reason": "disabled"}
+
+	if _reset_key_expired(user):
+		return {"valid": False, "reason": "expired"}
+
+	return {"valid": True}
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
@@ -190,6 +220,12 @@ def set_password_with_key(key: str, new_password: str):
 	if not user:
 		frappe.throw(
 			_("That password link is invalid or has already been used."),
+			frappe.AuthenticationError,
+		)
+
+	if _reset_key_expired(user):
+		frappe.throw(
+			_("That password link has expired. Ask an admin to send a new one."),
 			frappe.AuthenticationError,
 		)
 
