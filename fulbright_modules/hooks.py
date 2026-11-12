@@ -7,5 +7,11 @@ app_license = "mit"
 
 before_request = ["fulbright_modules.auth.async_email.patch_otp_email"]
 
-after_install = "fulbright_modules.gmail.setup.ensure_custom_fields"
-after_migrate = "fulbright_modules.gmail.setup.ensure_custom_fields"
+doc_events = {
+	"User": {
+		"before_insert": "fulbright_modules.auth.welcome.suppress_stock_welcome_mail",
+	},
+}
+
+after_install = "fulbright_modules.install.after_install"
+after_migrate = "fulbright_modules.install.after_migrate"

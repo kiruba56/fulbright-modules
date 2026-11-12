@@ -10,18 +10,25 @@ fulbright-modules/
   README.md
   fulbright_modules/
     hooks.py
-    modules.txt          # Auth, Gmail, …
+    install.py           # after_install / after_migrate custom fields
+    modules.txt          # Auth, Gmail, Fulbright HR, …
     auth/
-      api.py             # sign-in links, password reset
+      api.py             # sign-in links, password reset, welcome invite, set-password
+      welcome.py         # suppress stock Frappe desk welcome mail
       async_email.py     # background mail + OTP patch
     gmail/
       api.py             # connect / list / disconnect Gmail
+      setup.py           # Email Account team-sharing fields
+    fulbright_hr/
+      setup.py           # Employee Fulbright unit / compensation fields
 ```
+
+Module names in `modules.txt` must be unique across every installed app. Do not use `HR` — that belongs to HRMS, and a collision makes Frappe load HRMS DocTypes (e.g. Interview) from `fulbright_modules/hr/doctype/...`.
 
 ## Add a module
 
-1. Add the module name to `fulbright_modules/modules.txt`.
-2. Create `fulbright_modules/<module>/` with `__init__.py` and your code.
+1. Add a unique module name to `fulbright_modules/modules.txt`.
+2. Create `fulbright_modules/<scrubbed_module>/` with `__init__.py` and your code (e.g. `Fulbright HR` → `fulbright_hr/`).
 3. Whitelist methods with `@frappe.whitelist`. Paths become `fulbright_modules.<module>.api.<method>`.
 4. Push to `main`, rebuild the custom image, then restart the backend so the site picks up the new code.
 
@@ -126,7 +133,7 @@ Content-Type: application/json
 
 The response `message` contains `email`, `full_name`, and `sid`. Save that `sid` in the Fulbright session, then redirect the browser to `/`. The key expires in about 10 minutes, or whatever **Login with email link expiry** is set to in System Settings. Each key works once.
 
-Password reset:
+Password reset and new-user welcome both email a Fulbright `/set-password?key=...` link (never ERPNext `/update-password`). Stock Frappe User welcome mail is suppressed via `auth/welcome.py`.
 
 ```http
 POST /api/method/fulbright_modules.auth.api.send_password_reset
@@ -134,6 +141,27 @@ Content-Type: application/json
 
 { "email": "person@company.com" }
 ```
+
+After HR creates an Employee with Create User + Send Welcome Email:
+
+```http
+POST /api/method/fulbright_modules.auth.api.send_welcome_invite
+Cookie: sid=...
+Content-Type: application/json
+
+{ "email": "person@company.com" }
+```
+
+The set-password page posts:
+
+```http
+POST /api/method/fulbright_modules.auth.api.set_password_with_key
+Content-Type: application/json
+
+{ "key": "...", "new_password": "..." }
+```
+
+Response `message` is `{ email, full_name, sid }` — same shape as redeem login key. Fulbright creates its session cookie and redirects to `/`.
 
 ## Gmail
 

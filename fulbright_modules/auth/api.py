@@ -1,6 +1,7 @@
 import frappe
 from frappe import _
 from frappe.rate_limiter import rate_limit
+from frappe.utils import now_datetime
 
 from fulbright_modules.auth.async_email import start_immediately
 
@@ -13,6 +14,39 @@ def _password_reset_limit() -> int:
 	from frappe.core.doctype.user.user import get_password_reset_limit
 
 	return get_password_reset_limit()
+
+
+def _app_url() -> str:
+	app_url = (frappe.conf.get("fulbright_app_url") or "http://localhost:3000").rstrip("/")
+	if not app_url.startswith(("http://", "https://")):
+		frappe.throw(_("fulbright_app_url must start with http:// or https://"))
+	return app_url
+
+
+def _set_password_link(key: str, *, from_reset: bool = False) -> str:
+	base = f"{_app_url()}/set-password?key={key}"
+	return f"{base}&from=reset" if from_reset else base
+
+
+def _sha256_hash(value: str) -> str:
+	from frappe.utils import sha256_hash
+
+	return sha256_hash(value)
+
+
+def _issue_reset_key(user) -> str:
+	"""Create a reset key without sending Frappe's desk email."""
+	key = frappe.generate_hash()
+	user.db_set("reset_password_key", _sha256_hash(key))
+	user.db_set("last_reset_password_key_generated_on", now_datetime())
+	return key
+
+
+def _user_from_reset_key(key: str) -> str | None:
+	key = (key or "").strip()
+	if not key:
+		return None
+	return frappe.db.get_value("User", {"reset_password_key": _sha256_hash(key)})
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
@@ -34,11 +68,7 @@ def send_login_link(email: str):
 		expires_in_sec=expiry * 60,
 	)
 
-	app_url = (frappe.conf.get("fulbright_app_url") or "http://localhost:3000").rstrip("/")
-	if not app_url.startswith(("http://", "https://")):
-		frappe.throw(_("fulbright_app_url must start with http:// or https://"))
-
-	link = f"{app_url}/login/link?key={key}"
+	link = f"{_app_url()}/login/link?key={key}"
 	start_immediately(lambda: deliver_login_link(email, link, expiry))
 
 
@@ -50,6 +80,7 @@ def deliver_login_link(email: str, link: str, expiry: int):
 			"Use this link to sign in. It expires in {0} minutes.<br><br><a href='{1}'>Sign in</a>"
 		).format(expiry, link),
 		now=True,
+		with_container=True,
 	)
 
 
@@ -83,7 +114,98 @@ def deliver_password_reset(email: str):
 		return
 
 	user.validate_reset_password()
-	user._reset_password(send_email=True)
+	key = _issue_reset_key(user)
+	link = _set_password_link(key, from_reset=True)
+	frappe.sendmail(
+		recipients=email,
+		subject=_("Reset your Fulbright password"),
+		message=_(
+			"Hi {0}, use the link below to set a new password for your Fulbright account."
+			"<br><br><b>Login ID:</b> {1}"
+			"<br><br><a href='{2}'>Set password</a>"
+			"<br><br>If you did not request this, you can ignore this email."
+		).format(user.first_name or user.full_name or email, email, link),
+		now=True,
+		with_container=True,
+	)
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=_password_reset_limit, seconds=60 * 60)
+def send_welcome_invite(email: str):
+	"""Email a Next.js /set-password invite after HR creates a User."""
+	email = (email or "").strip()
+	if not email:
+		frappe.throw(_("Email is required"))
+
+	if frappe.session.user in (None, "Guest"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	if not frappe.db.exists("User", email):
+		frappe.throw(_("User {0} does not exist").format(email))
+
+	user = frappe.get_doc("User", email)
+	if user.name == "Administrator" or not user.enabled:
+		frappe.throw(_("This account can't be invited."))
+
+	account = user.name
+	start_immediately(lambda: deliver_welcome_invite(account))
+	return "queued"
+
+
+def deliver_welcome_invite(email: str):
+	user = frappe.get_doc("User", email)
+	if user.name == "Administrator" or not user.enabled:
+		return
+
+	key = _issue_reset_key(user)
+	link = _set_password_link(key)
+	name = user.first_name or user.full_name or email
+	frappe.sendmail(
+		recipients=email,
+		subject=_("Welcome to Fulbright"),
+		message=_(
+			"Hi {0}, an account has been created for you on Fulbright."
+			"<br><br>Before you can sign in, set your password."
+			"<br><br><b>Login ID:</b> {1}"
+			"<br><br><a href='{2}'>Set your password</a>"
+			"<br><br>If you weren't expecting this account, you can ignore this email."
+		).format(name, email, link),
+		now=True,
+		with_container=True,
+	)
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def set_password_with_key(key: str, new_password: str):
+	"""Set password from a Fulbright invite/reset key and return an ERPNext session."""
+	from frappe.core.doctype.user.user import update_password as stock_update_password
+
+	key = (key or "").strip()
+	new_password = new_password or ""
+	if not key or not new_password:
+		frappe.throw(_("Reset key and password are required."))
+
+	user = _user_from_reset_key(key)
+	if not user:
+		frappe.throw(
+			_("That password link is invalid or has already been used."),
+			frappe.AuthenticationError,
+		)
+
+	# Stock API validates strength, clears the key, and logs the user in.
+	stock_update_password(new_password=new_password, key=key, logout_all_sessions=1)
+
+	session_user = frappe.session.user
+	if not session_user or session_user == "Guest":
+		frappe.local.login_manager.login_as(user)
+		session_user = user
+
+	return {
+		"email": session_user,
+		"full_name": frappe.db.get_value("User", session_user, "full_name") or session_user,
+		"sid": frappe.session.sid,
+	}
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
