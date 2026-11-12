@@ -138,6 +138,34 @@ def send_password_reset(email: str):
 	start_immediately(lambda: deliver_password_reset(account))
 
 
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=_password_reset_limit, seconds=60 * 60)
+def send_password_reset_invite(email: str):
+	"""Admin: email a Fulbright /set-password reset link (clear errors)."""
+	email = (email or "").strip()
+	if not email:
+		frappe.throw(_("Email is required"))
+
+	if frappe.session.user in (None, "Guest"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	if not frappe.db.exists("User", email):
+		frappe.throw(_("User {0} does not exist").format(email))
+
+	user = frappe.get_doc("User", email)
+	if user.name == "Administrator" or not user.enabled:
+		frappe.throw(_("This account can't be reset."))
+
+	try:
+		user.validate_reset_password()
+	except frappe.ValidationError:
+		frappe.throw(_("Password reset is not allowed for this account."))
+
+	account = user.name
+	start_immediately(lambda: deliver_password_reset(account))
+	return "queued"
+
+
 def deliver_password_reset(email: str):
 	user = frappe.get_doc("User", email)
 	if user.name == "Administrator" or not user.enabled:
